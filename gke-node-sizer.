@@ -1,0 +1,978 @@
+
+import argparse
+import sys
+from google.cloud import container_v1
+from google.oauth2 import service_account
+from kubernetes import client, config
+from collections import defaultdict
+import math
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+# --- Configuration and Hard-coded Data ---
+
+# Hard-coded pricing for australia-southeast1 (Sydney)
+# Prices are per hour, based on public data as of early May 2025.
+# This dictionary structure:
+# 'machine-type': {'vcpu': int, 'memory_gb': float, 'on_demand_usd_hr': float, 'spot_usd_hr': float}
+MACHINE_TYPE_PRICING_SYDNEY = {
+    # E2 Machine Types
+    'e2-standard-2': {'vcpu': 2, 'memory_gb': 8, 'on_demand_usd_hr': 0.0951, 'spot_usd_hr': 0.0323},
+    'e2-standard-4': {'vcpu': 4, 'memory_gb': 16, 'on_demand_usd_hr': 0.1902, 'spot_usd_hr': 0.0646},
+    'e2-standard-8': {'vcpu': 8, 'memory_gb': 32, 'on_demand_usd_hr': 0.3804, 'spot_usd_hr': 0.1292},
+    'e2-highcpu-2': {'vcpu': 2, 'memory_gb': 2, 'on_demand_usd_hr': 0.0702, 'spot_usd_hr': 0.0238},
+    'e2-highcpu-4': {'vcpu': 4, 'memory_gb': 4, 'on_demand_usd_hr': 0.1404, 'spot_usd_hr': 0.0476},
+    'e2-highcpu-8': {'vcpu': 8, 'memory_gb': 8, 'on_demand_usd_hr': 0.2808, 'spot_usd_hr': 0.0952},
+    'e2-highmem-2': {'vcpu': 2, 'memory_gb': 16, 'on_demand_usd_hr': 0.1283, 'spot_usd_hr': 0.0435},
+    'e2-highmem-4': {'vcpu': 4, 'memory_gb': 32, 'on_demand_usd_hr': 0.2566, 'spot_usd_hr': 0.087},
+    'e2-highmem-8': {'vcpu': 8, 'memory_gb': 64, 'on_demand_usd_hr': 0.5132, 'spot_usd_hr': 0.174},
+
+    # N2 Machine Types
+    'n2-standard-2': {'vcpu': 2, 'memory_gb': 8, 'on_demand_usd_hr': 0.1378, 'spot_usd_hr': 0.0363},
+    'n2-standard-4': {'vcpu': 4, 'memory_gb': 16, 'on_demand_usd_hr': 0.2756, 'spot_usd_hr': 0.0726},
+    'n2-standard-8': {'vcpu': 8, 'memory_gb': 32, 'on_demand_usd_hr': 0.5512, 'spot_usd_hr': 0.1452},
+    'n2-highcpu-2': {'vcpu': 2, 'memory_gb': 2, 'on_demand_usd_hr': 0.1017, 'spot_usd_hr': 0.0268},
+    'n2-highcpu-4': {'vcpu': 4, 'memory_gb': 4, 'on_demand_usd_hr': 0.2034, 'spot_usd_hr': 0.0536},
+    'n2-highcpu-8': {'vcpu': 8, 'memory_gb': 8, 'on_demand_usd_hr': 0.4068, 'spot_usd_hr': 0.1072},
+    'n2-highmem-2': {'vcpu': 2, 'memory_gb': 16, 'on_demand_usd_hr': 0.1859, 'spot_usd_hr': 0.049},
+    'n2-highmem-4': {'vcpu': 4, 'memory_gb': 32, 'on_demand_usd_hr': 0.3718, 'spot_usd_hr': 0.098},
+    'n2-highmem-8': {'vcpu': 8, 'memory_gb': 64, 'on_demand_usd_hr': 0.7436, 'spot_usd_hr': 0.196},
+    # Note: Prices can fluctuate, these are estimates based on sources.
+
+    # Add more E2/N2 types if needed, ensuring vcpu, memory_gb, and prices are correct.
+}
+
+# Default list of machine types to consider for recommendations
+DEFAULT_CANDIDATE_MACHINE_TYPES = [
+    'e2-standard-2', 'e2-standard-4', 'e2-standard-8',
+    'e2-highcpu-2', 'e2-highcpu-4', 'e2-highcpu-8',
+    'e2-highmem-2', 'e2-highmem-4', 'e2-highmem-8',
+    'n2-standard-2', 'n2-standard-4', 'n2-standard-8',
+    'n2-highcpu-2', 'n2-highcpu-4', 'n2-highcpu-8',
+    'n2-highmem-2', 'n2-highmem-4', 'n2-highmem-8',
+]
+
+# Default system overhead per node (reserves some resources for OS, kubelet, etc.)
+# Values in vCPU (cores) and GiB (binary gigabytes)
+DEFAULT_SYSTEM_OVERHEAD_CPU = 0.1  # 100m
+DEFAULT_SYSTEM_OVERHEAD_MEMORY_GB = 0.128 # 128 MiB
+
+# Default buffer percentage for recommended node count
+DEFAULT_NODE_COUNT_BUFFER_PERCENT = 15 # 15%
+
+# Default weights for the scoring function (sum should ideally be 1, but relative values matter)
+# Priority: Cost > Utilization > Daemonset Overhead > IP Usage
+DEFAULT_SCORE_WEIGHTS = {
+    'cost': 0.4,
+    'utilization': 0.3,
+    'daemonset_overhead': 0.2,
+    'ip_usage': 0.1,
+}
+
+HOURS_PER_MONTH = 730 # Approx. hours in a month (24 * 365 / 12)
+
+# --- Helper Functions ---
+
+def parse_resource_string(resource_str):
+    """Parses k8s resource strings like '100m' or '1Gi'."""
+    if not isinstance(resource_str, str):
+        return 0 # Return 0 for None or non-string inputs
+
+    if resource_str.endswith('m'):
+        return int(resource_str[:-1]) / 1000 # Convert millicores to cores
+    elif resource_str.endswith('Gi'):
+        return int(resource_str[:-2]) # GiB
+    elif resource_str.endswith('Mi'):
+        return int(resource_str[:-2]) / 1024 # MiB to GiB
+    elif resource_str.endswith('G'): # Handle G (gigabytes) sometimes used, treat as GiB
+        return int(resource_str[:-1])
+    elif resource_str.endswith('M'): # Handle M (megabytes) sometimes used, treat as MiB
+         return int(resource_str[:-1]) / 1024
+    else:
+        # Assume core or bytes if no suffix, treat as cores or GiB (less common without suffix)
+        try:
+            # Try parsing as simple number (cores or GiB)
+            return float(resource_str)
+        except ValueError:
+            print(f"Warning: Could not parse resource string: {resource_str}", file=sys.stderr)
+            return 0
+
+def calculate_resource_requests(workload):
+    """Calculates total CPU and Memory requests for a workload (Deployment/StatefulSet)."""
+    total_cpu_req = 0
+    total_mem_req_gb = 0
+    pod_count = 0
+
+    if workload.kind == 'Deployment' and workload.spec.replicas is not None:
+        pod_count = workload.spec.replicas
+    elif workload.kind == 'StatefulSet' and workload.spec.replicas is not None:
+        pod_count = workload.spec.replicas
+    elif workload.kind == 'Pod': # Handle standalone pods if needed
+        pod_count = 1
+    # For other types or if replicas is None, assume 0 initially.
+    # In a real cluster analysis, you'd likely want to look at actual running pods
+    # or HPA configurations, but sticking to the requirement of current replicas.
+
+    if pod_count > 0 and workload.spec.template.spec.containers:
+        for container in workload.spec.template.spec.containers:
+            if container.resources and container.resources.requests:
+                cpu_req = container.resources.requests.get('cpu')
+                mem_req = container.resources.requests.get('memory')
+                if cpu_req:
+                    total_cpu_req += parse_resource_string(cpu_req) * pod_count
+                if mem_req:
+                    total_mem_req_gb += parse_resource_string(mem_req) * pod_count
+
+    return total_cpu_req, total_mem_req_gb, pod_count
+
+def calculate_daemonset_requests_per_node(daemonset):
+    """Calculates CPU and Memory requests per node for a DaemonSet."""
+    total_cpu_req = 0
+    total_mem_req_gb = 0
+
+    if daemonset.spec.template.spec.containers:
+        for container in daemonset.spec.template.spec.containers:
+            if container.resources and container.resources.requests:
+                cpu_req = container.resources.requests.get('cpu')
+                mem_req = container.resources.requests.get('memory')
+                if cpu_req:
+                    total_cpu_req += parse_resource_string(cpu_req)
+                if mem_req:
+                    total_mem_req_gb += parse_resource_string(mem_req)
+
+    return total_cpu_req, total_mem_req_gb
+
+def node_matches_workload(node_labels, node_taints, workload_spec):
+    """Checks if a node's labels and taints match a workload's selectors/tolerations."""
+    # Simplified logic: only check nodeSelector and simple tolerations
+
+    # Check nodeSelector
+    if workload_spec.node_selector:
+        for key, value in workload_spec.node_selector.items():
+            if node_labels.get(key) != value:
+                return False # Node does not match nodeSelector
+
+    # Check tolerations (simplified: just check if taint effect is tolerated)
+    # More complex logic would check operator, key, value, and effect combinations
+    workload_tolerations = workload_spec.tolerations or []
+    if node_taints:
+        for taint in node_taints:
+            tolerated = False
+            for toleration in workload_tolerations:
+                # Simple match: key matches, effect matches, operator is Exists or Key=Value match
+                if toleration.key == taint.key and \
+                   (toleration.effect is None or toleration.effect == taint.effect) and \
+                   (toleration.operator is None or toleration.operator == 'Exists' or \
+                    (toleration.operator == 'Equal' and toleration.value == taint.value)):
+                    tolerated = True
+                    break # Found a toleration for this taint
+            if not tolerated:
+                # This taint is not tolerated by the workload
+                return False
+
+    return True # Node matches selectors and tolerates taints (based on simplified logic)
+
+
+# --- Main Script Logic ---
+
+def analyze_gke_cluster(project_id, zone_or_region, cluster_name, sa_key_path=None,
+                        candidate_machine_types=DEFAULT_CANDIDATE_MACHINE_TYPES,
+                        node_count_buffer_percent=DEFAULT_NODE_COUNT_BUFFER_PERCENT,
+                        system_overhead_cpu=DEFAULT_SYSTEM_OVERHEAD_CPU,
+                        system_overhead_memory_gb=DEFAULT_SYSTEM_OVERHEAD_MEMORY_GB,
+                        score_weights=DEFAULT_SCORE_WEIGHTS):
+
+    # 1. Authenticate and Get Cluster Data
+    print(f"Connecting to GKE cluster {cluster_name} in {zone_or_region}, project {project_id}...")
+    gke_client = container_v1.ClusterManagerClient()
+
+    if zone_or_region.startswith('gcp-zones/'):
+         zone = zone_or_region.split('/')[-1]
+         region = None
+    elif zone_or_region.startswith('gcp-regions/'):
+         zone = None
+         region = zone_or_region.split('/')[-1]
+    else: # Assume it's just the zone/region name
+         if len(zone_or_region.split('-')) == 3: # e.g., us-central1-a
+             zone = zone_or_region
+             region = '-'.join(zone_or_region.split('-')[:2])
+         elif len(zone_or_region.split('-')) >= 2: # e.g., us-central1, or australia-southeast1
+             region = zone_or_region
+             zone = None # We'll need to fetch zones later if not provided
+
+
+    cluster_path = f'projects/{project_id}/locations/{zone_or_region}/{cluster_name}'
+    try:
+        cluster = gke_client.get_cluster(name=cluster_path)
+        print(f"Successfully connected to cluster {cluster.name}")
+        if not region: # If only zone was provided, infer region
+             region = '-'.join(cluster.zone.split('-')[:2]) if cluster.zone else None
+             if region:
+                 print(f"Inferred region: {region}")
+
+    except Exception as e:
+        print(f"Error connecting to GKE cluster: {e}", file=sys.stderr)
+        return None
+
+    # Authenticate to Kubernetes
+    try:
+        config.load_kube_config()
+        k8s_apps_v1 = client.AppsV1Api()
+        k8s_core_v1 = client.CoreV1Api()
+        print("Successfully connected to Kubernetes API.")
+    except Exception as e:
+        print(f"Error connecting to Kubernetes API: {e}", file=sys.stderr)
+        print("Please ensure kubectl is configured correctly.", file=sys.stderr)
+        return None
+
+    # Get all workloads and DaemonSets
+    print("Fetching Kubernetes workloads and DaemonSets...")
+    try:
+        deployments = k8s_apps_v1.list_deployment_for_all_namespaces().items
+        statefulsets = k8s_apps_v1.list_stateful_set_for_all_namespaces().items
+        daemonsets = k8s_apps_v1.list_daemon_set_for_all_namespaces().items
+        # Include standalone pods? Requirement was based on replicas, so skip standalone pods for simplicity unless explicitly needed.
+        # pods = k8s_core_v1.list_pod_for_all_namespaces().items
+    except Exception as e:
+        print(f"Error fetching Kubernetes workloads: {e}", file=sys.stderr)
+        return None
+
+    all_workloads = deployments + statefulsets # + pods # Add pods if including standalone
+    print(f"Found {len(all_workloads)} Deployments/StatefulSets and {len(daemonsets)} DaemonSets.")
+
+
+    # 2. Process Node Pools
+    recommendations = {}
+    for node_pool in cluster.node_pools:
+        if node_pool.autopool:
+            print(f"Skipping autopool node pool: {node_pool.name}")
+            continue
+
+        print(f"\n--- Analyzing Node Pool: {node_pool.name} ---")
+        current_machine_type = node_pool.config.machine_type
+        current_node_count = node_pool.initial_node_count # Use initial_node_count as a baseline
+        if node_pool.autoscaling and node_pool.autoscaling.enabled:
+             print(f"Note: Node pool {node_pool.name} has autoscaling enabled (min: {node_pool.autoscaling.min_node_count}, max: {node_pool.autoscaling.max_node_count}). Analysis uses initial node count ({current_node_count}) for calculation.")
+             # Consider using current actual node count if needed, but initial_node_count aligns with configuration recommendations
+             # actual_node_count = # Need to get node list from K8s API and count nodes belonging to this pool
+
+        current_max_pods_per_node = node_pool.max_pods_constraint.max_pods if node_pool.max_pods_constraint else 110 # Default GKE max pods
+        is_spot_pool = node_pool.config.spot
+        node_labels = node_pool.config.labels or {}
+        node_taints = node_pool.config.taints or []
+
+        print(f"Current config: {current_machine_type}, {current_node_count} nodes, {current_max_pods_per_node} max pods per node, Spot: {is_spot_pool}")
+
+        # 2.1 Filter workloads and DaemonSets for this node pool
+        pool_workloads = []
+        pool_daemonsets = []
+
+        # Get actual nodes in this pool to check selectors/tolerations precisely
+        # This requires listing nodes via K8s API and matching node pool name/labels
+        try:
+            all_k8s_nodes = k8s_core_v1.list_node().items
+            pool_nodes = [
+                node for node in all_k8s_nodes
+                if node_pool.name in node.metadata.labels.get('cloud.google.com/gke-nodepool', '') # Match node pool label
+            ]
+            if not pool_nodes and current_node_count > 0:
+                 print(f"Warning: Could not find any Kubernetes nodes for node pool {node_pool.name}. Cannot accurately filter workloads/DaemonSets.", file=sys.stderr)
+                 # Fallback: Assume all workloads/daemonsets without explicit node selectors/tolerations could land here,
+                 # or use node pool labels/taints directly for a theoretical match.
+                 # Using node pool labels/taints directly is more robust for recommendation logic.
+                 print("Attempting to match workloads/DaemonSets based on node pool labels/taints directly.")
+                 # Create a dummy node object with node pool labels/taints for matching
+                 dummy_node = type('Node', (object,), {})()
+                 dummy_node.metadata = type('Metadata', (object,), {})()
+                 dummy_node.metadata.labels = node_labels
+                 dummy_node.spec = type('Spec', (object,), {})()
+                 dummy_node.spec.taints = node_taints
+
+                 for workload in all_workloads:
+                      if workload.spec.template.spec:
+                           if node_matches_workload(dummy_node.metadata.labels, dummy_node.spec.taints, workload.spec.template.spec):
+                                pool_workloads.append(workload)
+
+                 for ds in daemonsets:
+                      if ds.spec.template.spec:
+                           if node_matches_workload(dummy_node.metadata.labels, dummy_node.spec.taints, ds.spec.template.spec):
+                                pool_daemonsets.append(ds)
+
+            else: # Use actual nodes for matching
+                 # For each workload, check if it can be scheduled on *at least one* node in this pool
+                 # This is a simplification; ideally, we'd know exactly *which* pool each workload is assigned to.
+                 # A more accurate approach would be to look at the current node of running pods.
+                 # Sticking to the requirement of using selectors/tolerations for the *node pool*.
+                 # Let's check if the workload *could* run on a theoretical node with the pool's labels/taints.
+                 dummy_node = type('Node', (object,), {})()
+                 dummy_node.metadata = type('Metadata', (object,), {})()
+                 dummy_node.metadata.labels = node_labels
+                 dummy_node.spec = type('Spec', (object,), {})()
+                 dummy_node.spec.taints = node_taints
+
+                 for workload in all_workloads:
+                      if workload.spec.template.spec:
+                           if node_matches_workload(dummy_node.metadata.labels, dummy_node.spec.taints, workload.spec.template.spec):
+                                pool_workloads.append(workload)
+
+                 for ds in daemonsets:
+                      if ds.spec.template.spec:
+                           if node_matches_workload(dummy_node.metadata.labels, dummy_node.spec.taints, ds.spec.template.spec):
+                                pool_daemonsets.append(ds)
+
+        except Exception as e:
+             print(f"Warning: Could not list Kubernetes nodes or filter by node pool label: {e}", file=sys.stderr)
+             print("Analysis may be inaccurate for node pool workload filtering.", file=sys.stderr)
+             # Fallback: Assume all workloads/daemonsets could potentially run anywhere if filtering fails.
+             pool_workloads = all_workloads
+             pool_daemonsets = daemonsets
+
+
+        print(f"Identified {len(pool_workloads)} workloads and {len(pool_daemonsets)} DaemonSets potentially running on this pool.")
+
+        # 2.2 Calculate total required resources and pods for this pool
+        total_pool_cpu_req = 0
+        total_pool_mem_req_gb = 0
+        total_pool_required_pods = 0
+
+        for workload in pool_workloads:
+            cpu_req, mem_req_gb, pod_count = calculate_resource_requests(workload)
+            total_pool_cpu_req += cpu_req
+            total_pool_mem_req_gb += mem_req_gb
+            total_pool_required_pods += pod_count
+
+        daemonset_cpu_req_per_node = 0
+        daemonset_mem_req_gb_per_node = 0
+        for ds in pool_daemonsets:
+            cpu_req, mem_req_gb = calculate_daemonset_requests_per_node(ds)
+            daemonset_cpu_req_per_node += cpu_req
+            daemonset_mem_req_gb_per_node += mem_req_gb
+
+        print(f"Total required workload resources (requests): {total_pool_cpu_req:.2f} CPU, {total_pool_mem_req_gb:.2f} GiB Memory")
+        print(f"Total required pods: {total_pool_required_pods}")
+        print(f"DaemonSet requests per node: {daemonset_cpu_req_per_node:.2f} CPU, {daemonset_mem_req_gb_per_node:.2f} GiB Memory")
+
+        # 2.3 Calculate current state metrics
+        current_mt_info = MACHINE_TYPE_PRICING_SYDNEY.get(current_machine_type)
+        if not current_mt_info:
+            print(f"Warning: Pricing/specs not found for current machine type {current_machine_type}. Cannot calculate current cost/utilization.", file=sys.stderr)
+            current_state = None # Cannot evaluate current state metrics
+        else:
+            current_total_vcpu_capacity = current_node_count * current_mt_info['vcpu']
+            current_total_memory_gb_capacity = current_node_count * current_mt_info['memory_gb']
+
+            current_usable_cpu_per_node = current_mt_info['vcpu'] - system_overhead_cpu - daemonset_cpu_req_per_node
+            current_usable_memory_gb_per_node = current_mt_info['memory_gb'] - system_overhead_memory_gb - daemonset_mem_req_gb_per_node
+
+            current_total_usable_cpu = current_node_count * max(0, current_usable_cpu_per_node)
+            current_total_usable_memory_gb = current_node_count * max(0, current_usable_memory_gb_per_node)
+
+            # Ensure we don't divide by zero if no requests or no usable capacity
+            current_cpu_utilization = (total_pool_cpu_req / current_total_usable_cpu) if current_total_usable_cpu > 0 else float('inf') if total_pool_cpu_req > 0 else 0
+            current_mem_utilization = (total_pool_mem_req_gb / current_total_usable_memory_gb) if current_total_usable_memory_gb > 0 else float('inf') if total_pool_mem_req_gb > 0 else 0
+
+            current_total_potential_ips = current_node_count * current_max_pods_per_node
+            current_ip_utilization = (total_pool_required_pods / current_total_potential_ips) if current_total_potential_ips > 0 else float('inf') if total_pool_required_pods > 0 else 0
+
+            current_hourly_cost_per_node = current_mt_info['spot_usd_hr'] if is_spot_pool else current_mt_info['on_demand_usd_hr']
+            current_total_monthly_cost = current_node_count * current_hourly_cost_per_node * HOURS_PER_MONTH
+
+            # Calculate cost breakdown for current state
+            current_total_capacity_cost_hr = current_node_count * current_hourly_cost_per_node
+            # Need cost per vCPU and per GB to break down cost accurately.
+            # Since we only have total machine hourly cost hardcoded, we'll approximate
+            # based on the proportion of CPU/Memory in the machine type definition.
+            # This is an approximation! Pricing models are more complex.
+            if current_mt_info['vcpu'] + current_mt_info['memory_gb'] > 0: # Avoid division by zero
+                 vcpu_cost_proportion = current_mt_info['vcpu'] / (current_mt_info['vcpu'] + current_mt_info['memory_gb'])
+                 mem_cost_proportion = current_mt_info['memory_gb'] / (current_mt_info['vcpu'] + current_mt_info['memory_gb'])
+            else:
+                 vcpu_cost_proportion = 0.5 # Default to 50/50 if no clear ratio
+                 mem_cost_proportion = 0.5
+
+
+            current_total_cpu_capacity_cost_hr = current_total_capacity_cost_hr * vcpu_cost_proportion
+            current_total_mem_capacity_cost_hr = current_total_capacity_cost_hr * mem_cost_proportion
+
+            # Cost attributed to requested user resources
+            current_requested_cost_hr = 0
+            if current_total_vcpu_capacity > 0:
+                 current_requested_cpu_cost_hr = current_total_cpu_capacity_cost_hr * (total_pool_cpu_req / current_total_vcpu_capacity)
+                 current_requested_cost_hr += current_requested_cpu_cost_hr
+            else:
+                 current_requested_cpu_cost_hr = 0
+
+            if current_total_memory_gb_capacity > 0:
+                 current_requested_mem_cost_hr = current_total_mem_capacity_cost_hr * (total_pool_mem_req_gb / current_total_memory_gb_capacity)
+                 current_requested_cost_hr += current_requested_mem_cost_hr
+            else:
+                 current_requested_mem_cost_hr = 0
+
+
+            # Cost attributed to DaemonSets
+            current_daemonset_cost_hr = 0
+            if current_total_vcpu_capacity > 0:
+                 current_daemonset_cpu_cost_hr = current_total_cpu_capacity_cost_hr * ((daemonset_cpu_req_per_node * current_node_count) / current_total_vcpu_capacity)
+                 current_daemonset_cost_hr += current_daemonset_cpu_cost_hr
+            else:
+                 current_daemonset_cpu_cost_hr = 0
+
+            if current_total_memory_gb_capacity > 0:
+                current_daemonset_mem_cost_hr = current_total_mem_capacity_cost_hr * ((daemonset_mem_req_gb_per_node * current_node_count) / current_total_memory_gb_capacity)
+                current_daemonset_cost_hr += current_daemonset_mem_cost_hr
+            else:
+                 current_daemonset_mem_cost_hr = 0
+
+            # Cost attributed to System Overhead
+            current_system_overhead_cost_hr = 0
+            if current_total_vcpu_capacity > 0:
+                 current_system_cpu_cost_hr = current_total_cpu_capacity_cost_hr * ((system_overhead_cpu * current_node_count) / current_total_vcpu_capacity)
+                 current_system_overhead_cost_hr += current_system_cpu_cost_hr
+            else:
+                current_system_cpu_cost_hr = 0
+
+            if current_total_memory_gb_capacity > 0:
+                current_system_mem_cost_hr = current_total_mem_capacity_cost_hr * ((system_overhead_memory_gb * current_node_count) / current_total_memory_gb_capacity)
+                current_system_overhead_cost_hr += current_system_mem_cost_hr
+            else:
+                current_system_mem_cost_hr = 0
+
+
+            # Cost of Unallocated Resources
+            current_unallocated_cost_hr = current_total_capacity_cost_hr - current_requested_cost_hr - current_daemonset_cost_hr - current_system_overhead_cost_hr
+
+            current_state = {
+                'machine_type': current_machine_type,
+                'node_count': current_node_count,
+                'max_pods_per_node': current_max_pods_per_node,
+                'is_spot': is_spot_pool,
+                'total_monthly_cost_usd': current_total_monthly_cost,
+                'cpu_utilization': current_cpu_utilization,
+                'memory_utilization': current_mem_utilization,
+                'ip_utilization': current_ip_utilization,
+                'daemonset_overhead_cpu': daemonset_cpu_req_per_node * current_node_count,
+                'daemonset_overhead_mem_gb': daemonset_mem_req_gb_per_node * current_node_count,
+                'cost_unallocated_monthly_usd': current_unallocated_cost_hr * HOURS_PER_MONTH,
+                'cost_daemonsets_monthly_usd': current_daemonset_cost_hr * HOURS_PER_MONTH,
+                'cost_requested_monthly_usd': current_requested_cost_hr * HOURS_PER_MONTH,
+                'cost_system_overhead_monthly_usd': current_system_overhead_cost_hr * HOURS_PER_MONTH,
+                 'total_cpu_capacity': current_total_vcpu_capacity,
+                 'total_mem_capacity_gb': current_total_memory_gb_capacity,
+                 'total_potential_ips': current_total_potential_ips,
+                 'total_required_pods': total_pool_required_pods,
+                 'total_requested_cpu': total_pool_cpu_req,
+                 'total_requested_mem_gb': total_pool_mem_req_gb,
+            }
+
+
+        # 2.4 Explore candidate configurations and find the best recommendation
+        best_recommendation = None
+        best_score = -float('inf')
+        evaluated_configurations = [] # To store data for the HTML report
+
+        print("Evaluating candidate machine types...")
+        for candidate_mt_name in candidate_machine_types:
+            candidate_mt_info = MACHINE_TYPE_PRICING_SYDNEY.get(candidate_mt_name)
+
+            if not candidate_mt_info:
+                print(f"Warning: Pricing/specs not found for candidate machine type {candidate_mt_name}. Skipping.", file=sys.stderr)
+                continue
+
+            # Calculate usable capacity per node for this candidate type
+            candidate_usable_cpu_per_node = candidate_mt_info['vcpu'] - system_overhead_cpu - daemonset_cpu_req_per_node
+            candidate_usable_memory_gb_per_node = candidate_mt_info['memory_gb'] - system_overhead_memory_gb - daemonset_mem_req_gb_per_node
+
+            # Cannot use this machine type if it can't even fit DaemonSets + system overhead
+            if candidate_usable_cpu_per_node <= 0 or candidate_usable_memory_gb_per_node <= 0:
+                # print(f"Candidate {candidate_mt_name} cannot fit DaemonSets + system overhead. Skipping.")
+                continue
+
+            # Calculate recommended node count based on required resources
+            # Avoid division by zero if no requests
+            required_nodes_cpu = math.ceil(total_pool_cpu_req / candidate_usable_cpu_per_node) if candidate_usable_cpu_per_node > 0 and total_pool_cpu_req > 0 else 0
+            required_nodes_mem = math.ceil(total_pool_mem_req_gb / candidate_usable_memory_gb_per_node) if candidate_usable_memory_gb_per_node > 0 and total_pool_mem_req_gb > 0 else 0
+
+            recommended_node_count_raw = max(required_nodes_cpu, required_nodes_mem, 1) # Ensure at least 1 node if any pods are required
+            recommended_node_count = math.ceil(recommended_node_count_raw * (1 + node_count_buffer_percent / 100.0))
+
+            # Calculate recommended max pods per node
+            # Need enough total IP capacity for required pods with some buffer
+            min_max_pods = math.ceil(total_pool_required_pods / recommended_node_count) if recommended_node_count > 0 and total_pool_required_pods > 0 else 1 # At least 1 pod capacity
+            # Recommend min_max_pods, rounded up to nearest 10, but not exceeding GKE default 110 significantly unless necessary
+            # Or keep current if it's already efficient? Let's recommend a calculated value.
+            recommended_max_pods_per_node = max(min_max_pods, 10) # Ensure at least 10
+            # Optional: Add a small buffer to max pods per node too, e.g., +10%
+            # recommended_max_pods_per_node = math.ceil(recommended_max_pods_per_node * 1.1)
+            # Cap at a reasonable upper limit if needed, e.g., 256 or 512
+            recommended_max_pods_per_node = min(recommended_max_pods_per_node, 256) # Arbitrary cap
+
+
+            # Calculate metrics for this candidate configuration
+            candidate_hourly_cost_per_node = candidate_mt_info['spot_usd_hr'] if is_spot_pool else candidate_mt_info['on_demand_usd_hr']
+            candidate_total_monthly_cost = recommended_node_count * candidate_hourly_cost_per_node * HOURS_PER_MONTH
+
+            candidate_total_vcpu_capacity = recommended_node_count * candidate_mt_info['vcpu']
+            candidate_total_memory_gb_capacity = recommended_node_count * candidate_mt_info['memory_gb']
+            candidate_total_usable_cpu = recommended_node_count * max(0, candidate_usable_cpu_per_node)
+            candidate_total_usable_memory_gb = recommended_node_count * max(0, candidate_usable_memory_gb_per_node)
+
+            candidate_cpu_utilization = (total_pool_cpu_req / candidate_total_usable_cpu) if candidate_total_usable_cpu > 0 else float('inf') if total_pool_cpu_req > 0 else 0
+            candidate_mem_utilization = (total_pool_mem_req_gb / candidate_total_usable_memory_gb) if candidate_total_usable_memory_gb > 0 else float('inf') if total_pool_mem_req_gb > 0 else 0
+
+            candidate_total_potential_ips = recommended_node_count * recommended_max_pods_per_node
+            candidate_ip_utilization = (total_pool_required_pods / candidate_total_potential_ips) if candidate_total_potential_ips > 0 else float('inf') if total_pool_required_pods > 0 else 0
+
+            # Calculate cost breakdown for candidate state (using approximation method again)
+            candidate_total_capacity_cost_hr = recommended_node_count * candidate_hourly_cost_per_node
+
+            if candidate_mt_info['vcpu'] + candidate_mt_info['memory_gb'] > 0: # Avoid division by zero
+                 vcpu_cost_proportion = candidate_mt_info['vcpu'] / (candidate_mt_info['vcpu'] + candidate_mt_info['memory_gb'])
+                 mem_cost_proportion = candidate_mt_info['memory_gb'] / (candidate_mt_info['vcpu'] + candidate_mt_info['memory_gb'])
+            else:
+                 vcpu_cost_proportion = 0.5
+                 mem_cost_proportion = 0.5
+
+            candidate_total_cpu_capacity_cost_hr = candidate_total_capacity_cost_hr * vcpu_cost_proportion
+            candidate_total_mem_capacity_cost_hr = candidate_total_capacity_cost_hr * mem_cost_proportion
+
+            candidate_requested_cost_hr = 0
+            if candidate_total_vcpu_capacity > 0:
+                 candidate_requested_cpu_cost_hr = candidate_total_cpu_capacity_cost_hr * (total_pool_cpu_req / candidate_total_vcpu_capacity)
+                 candidate_requested_cost_hr += candidate_requested_cpu_cost_hr
+            else:
+                candidate_requested_cpu_cost_hr = 0
+
+            if candidate_total_memory_gb_capacity > 0:
+                 candidate_requested_mem_cost_hr = candidate_total_mem_capacity_cost_hr * (total_pool_mem_req_gb / candidate_total_memory_gb_capacity)
+                 candidate_requested_cost_hr += candidate_requested_mem_cost_hr
+            else:
+                candidate_requested_mem_cost_hr = 0
+
+            candidate_daemonset_cost_hr = 0
+            if candidate_total_vcpu_capacity > 0:
+                 candidate_daemonset_cpu_cost_hr = candidate_total_cpu_capacity_cost_hr * ((daemonset_cpu_req_per_node * recommended_node_count) / candidate_total_vcpu_capacity)
+                 candidate_daemonset_cost_hr += candidate_daemonset_cpu_cost_hr
+            else:
+                 candidate_daemonset_cpu_cost_hr = 0
+
+            if candidate_total_memory_gb_capacity > 0:
+                 candidate_daemonset_mem_cost_hr = candidate_total_mem_capacity_cost_hr * ((daemonset_mem_req_gb_per_node * recommended_node_count) / candidate_total_memory_gb_capacity)
+                 candidate_daemonset_cost_hr += candidate_daemonset_mem_cost_hr
+            else:
+                 candidate_daemonset_mem_cost_hr = 0
+
+            candidate_system_overhead_cost_hr = 0
+            if candidate_total_vcpu_capacity > 0:
+                 candidate_system_cpu_cost_hr = candidate_total_cpu_capacity_cost_hr * ((system_overhead_cpu * recommended_node_count) / candidate_total_vcpu_capacity)
+                 candidate_system_overhead_cost_hr += candidate_system_cpu_cost_hr
+            else:
+                 candidate_system_cpu_cost_hr = 0
+
+            if candidate_total_memory_gb_capacity > 0:
+                 candidate_system_mem_cost_hr = candidate_total_mem_capacity_cost_hr * ((system_overhead_memory_gb * recommended_node_count) / candidate_total_memory_gb_capacity)
+                 candidate_system_overhead_cost_hr += candidate_system_mem_cost_hr
+            else:
+                 candidate_system_mem_cost_hr = 0
+
+
+            candidate_unallocated_cost_hr = candidate_total_capacity_cost_hr - candidate_requested_cost_hr - candidate_daemonset_cost_hr - candidate_system_overhead_cost_hr
+
+            candidate_state = {
+                'machine_type': candidate_mt_name,
+                'node_count': recommended_node_count,
+                'max_pods_per_node': recommended_max_pods_per_node,
+                'is_spot': is_spot_pool,
+                'total_monthly_cost_usd': candidate_total_monthly_cost,
+                'cpu_utilization': candidate_cpu_utilization,
+                'memory_utilization': candidate_mem_utilization,
+                'ip_utilization': candidate_ip_utilization,
+                 'daemonset_overhead_cpu': daemonset_cpu_req_per_node * recommended_node_count,
+                'daemonset_overhead_mem_gb': daemonset_mem_req_gb_per_node * recommended_node_count,
+                 'cost_unallocated_monthly_usd': candidate_unallocated_cost_hr * HOURS_PER_MONTH,
+                'cost_daemonsets_monthly_usd': candidate_daemonset_cost_hr * HOURS_PER_MONTH,
+                 'cost_requested_monthly_usd': candidate_requested_cost_hr * HOURS_PER_MONTH,
+                 'cost_system_overhead_monthly_usd': candidate_system_overhead_cost_hr * HOURS_PER_MONTH,
+                  'total_cpu_capacity': candidate_total_vcpu_capacity,
+                 'total_mem_capacity_gb': candidate_total_memory_gb_capacity,
+                 'total_potential_ips': candidate_total_potential_ips,
+                 'total_required_pods': total_pool_required_pods,
+                 'total_requested_cpu': total_pool_cpu_req,
+                 'total_requested_mem_gb': total_pool_mem_req_gb,
+            }
+
+            # Calculate Score
+            # Normalizing metrics might be needed for accurate scoring, but let's use raw values with weights first.
+            # Need to handle 'inf' or division by zero if utilization/ip_usage is calculated incorrectly.
+            # Higher utilization is better -> use value directly.
+            # Lower cost/overhead/IP waste is better -> use inverse or negative value.
+            # Ensure no division by zero if total cost, overhead or IP capacity is zero.
+
+            # Handling edge cases for scoring:
+            # If cost is 0 (shouldn't happen with real VMs), 1/cost would be inf. Use negative cost instead.
+            # If utilization is inf (requests > usable capacity), this is bad. Assign a very low score or penalty.
+            # If ip_utilization is inf (required pods > potential IPs), this is bad. Assign a very low score or penalty.
+            # If daemonset_overhead is 0 (no daemonsets), 1/overhead would be inf. Use negative overhead or handle separately.
+
+            score = 0
+
+            # Cost (lower is better, use negative cost)
+            score += score_weights['cost'] * (-candidate_state['total_monthly_cost_usd'])
+
+            # Utilization (higher is better) - Use average of CPU/Mem utilization, or score separately?
+            # Let's average CPU and Memory utilization for simplicity in scoring. Cap at 1.0 to avoid favoring massive over-requests.
+            avg_utilization = min(1.0, (candidate_state['cpu_utilization'] + candidate_state['memory_utilization']) / 2.0)
+            if candidate_state['cpu_utilization'] > 1.0 or candidate_state['memory_utilization'] > 1.0:
+                 # Penalize heavily if requests exceed usable capacity
+                 score -= 1000 # Arbitrary large penalty
+            score += score_weights['utilization'] * avg_utilization
+
+            # DaemonSet Overhead (lower is better, use negative total daemonset requests)
+            # Summing CPU and Memory requests is an approximation. Could weight CPU/Mem cost instead.
+            # Let's use the calculated DaemonSet cost as the metric to minimize.
+            score += score_weights['daemonset_overhead'] * (-candidate_state['cost_daemonsets_monthly_usd'])
+
+
+            # IP Usage (closer to 1.0 is better, penalize excessive waste or insufficiency)
+            # Ideal IP utilization is 1.0, but > 1.0 is bad (not enough IPs).
+            # < 1.0 means waste. Penalty for waste increases as utilization decreases.
+            # Penalty for insufficient IPs is very high.
+            ip_utilization = candidate_state['ip_utilization']
+            ip_score = 0
+            if ip_utilization > 1.0:
+                 ip_score = -1000 # Heavy penalty for not enough IPs
+            else:
+                 # Reward utilization closer to 1.0. Could use a function like - (1 - ip_utilization)^2 or similar.
+                 # Let's use a simple linear scale for now: 0 score at 0 utilization, max score at 1.0 utilization.
+                 ip_score = ip_utilization
+            score += score_weights['ip_usage'] * ip_score
+
+
+            # Store evaluated config for reporting
+            evaluated_configurations.append(candidate_state)
+
+            # Update best recommendation if this one is better
+            if score > best_score:
+                best_score = score
+                best_recommendation = candidate_state
+
+        # Store results for this node pool
+        recommendations[node_pool.name] = {
+            'current': current_state, # Will be None if pricing/specs not found
+            'recommended': best_recommendation, # Will be None if no suitable candidate found
+            'evaluated_configs': evaluated_configurations # Data for charts
+        }
+
+    return recommendations
+
+# --- Output Functions ---
+
+def print_recommendations_to_console(recommendations):
+    print("\n--- Recommendation Summary ---")
+    for pool_name, data in recommendations.items():
+        print(f"\nNode Pool: {pool_name}")
+        current = data.get('current')
+        recommended = data.get('recommended')
+
+        if current:
+            print("  Current Configuration:")
+            print(f"    Machine Type: {current['machine_type']}")
+            print(f"    Node Count: {current['node_count']}")
+            print(f"    Max Pods per Node: {current['max_pods_per_node']}")
+            print(f"    Estimated Monthly Cost: ${current['total_monthly_cost_usd']:.2f}")
+            print(f"    Estimated CPU Utilization (Requests/Usable): {current['cpu_utilization']:.1%}")
+            print(f"    Estimated Memory Utilization (Requests/Usable): {current['memory_utilization']:.1%}")
+            print(f"    Estimated IP Utilization (Required/Potential): {current['ip_utilization']:.1%}")
+            print(f"    Estimated Monthly Cost Breakdown:")
+            print(f"      - Requested User Resources: ${current['cost_requested_monthly_usd']:.2f}")
+            print(f"      - DaemonSets Overhead:    ${current['cost_daemonsets_monthly_usd']:.2f}")
+            print(f"      - System Overhead:        ${current['cost_system_overhead_monthly_usd']:.2f}")
+            print(f"      - Unallocated Resources:  ${current['cost_unallocated_monthly_usd']:.2f}")
+
+        else:
+            print("  Current Configuration: Not available (pricing/specs missing)")
+
+        if recommended:
+            print("  Recommended Configuration:")
+            print(f"    Machine Type: {recommended['machine_type']}")
+            print(f"    Node Count: {recommended['node_count']}")
+            print(f"    Max Pods per Node: {recommended['max_pods_per_node']}")
+            print(f"    Estimated Monthly Cost: ${recommended['total_monthly_cost_usd']:.2f}")
+            print(f"    Estimated CPU Utilization (Requests/Usable): {recommended['cpu_utilization']:.1%}")
+            print(f"    Estimated Memory Utilization (Requests/Usable): {recommended['memory_utilization']:.1%}")
+            print(f"    Estimated IP Utilization (Required/Potential): {recommended['ip_utilization']:.1%}")
+             print(f"    Estimated Monthly Cost Breakdown:")
+            print(f"      - Requested User Resources: ${recommended['cost_requested_monthly_usd']:.2f}")
+            print(f"      - DaemonSets Overhead:    ${recommended['cost_daemonsets_monthly_usd']:.2f}")
+            print(f"      - System Overhead:        ${recommended['cost_system_overhead_monthly_usd']:.2f}")
+            print(f"      - Unallocated Resources:  ${recommended['cost_unallocated_monthly_usd']:.2f}")
+
+
+            if current:
+                 cost_savings = current['total_monthly_cost_usd'] - recommended['total_monthly_cost_usd']
+                 print(f"  Estimated Monthly Cost Savings: ${cost_savings:.2f}")
+        else:
+            print("  Recommended Configuration: Could not find a suitable recommendation.")
+
+
+def generate_html_report(recommendations, output_path="gke_recommendation_report.html"):
+    print(f"\nGenerating HTML report: {output_path}")
+
+    # Prepare data for charts
+    report_data = []
+    for pool_name, data in recommendations.items():
+        current = data.get('current')
+        recommended = data.get('recommended')
+
+        if current:
+             report_data.append({
+                 'pool_name': pool_name,
+                 'config_type': 'Current',
+                 'Total Monthly Cost': current['total_monthly_cost_usd'],
+                 'Cost - Requested User Resources': current['cost_requested_monthly_usd'],
+                 'Cost - DaemonSets Overhead': current['cost_daemonsets_monthly_usd'],
+                 'Cost - System Overhead': current['cost_system_overhead_monthly_usd'],
+                 'Cost - Unallocated Resources': current['cost_unallocated_monthly_usd'],
+             })
+        if recommended:
+             report_data.append({
+                 'pool_name': pool_name,
+                 'config_type': 'Recommended',
+                 'Total Monthly Cost': recommended['total_monthly_cost_usd'],
+                 'Cost - Requested User Resources': recommended['cost_requested_monthly_usd'],
+                 'Cost - DaemonSets Overhead': recommended['cost_daemonsets_monthly_usd'],
+                 'Cost - System Overhead': recommended['cost_system_overhead_monthly_usd'],
+                 'Cost - Unallocated Resources': recommended['cost_unallocated_monthly_usd'],
+             })
+
+    if not report_data:
+        print("No data available to generate HTML report.", file=sys.stderr)
+        return
+
+    df = pd.DataFrame(report_data)
+
+    # Create Total Cost Comparison Chart
+    fig_cost_compare = go.Figure()
+    for pool_name in df['pool_name'].unique():
+        pool_df = df[df['pool_name'] == pool_name]
+        fig_cost_compare.add_trace(go.Bar(
+            x=[f"{pool_name} (Current)", f"{pool_name} (Recommended)"],
+            y=pool_df[pool_df['config_type'] == 'Current']['Total Monthly Cost'].values.tolist() +
+              pool_df[pool_df['config_type'] == 'Recommended']['Total Monthly Cost'].values.tolist(),
+            name=pool_name
+        ))
+
+    fig_cost_compare.update_layout(
+        barmode='group',
+        title='Monthly Cost Comparison (Current vs. Recommended)',
+        yaxis_title='Estimated Monthly Cost (USD)',
+        xaxis_title='Node Pool'
+    )
+
+    # Create Cost Breakdown Charts (Stacked Bar)
+    cost_breakdown_categories = ['Cost - Requested User Resources', 'Cost - DaemonSets Overhead', 'Cost - System Overhead', 'Cost - Unallocated Resources']
+
+    breakdown_figs = {}
+    for pool_name in df['pool_name'].unique():
+        pool_df = df[df['pool_name'] == pool_name]
+        fig_breakdown = go.Figure()
+        for category in cost_breakdown_categories:
+            fig_breakdown.add_trace(go.Bar(
+                x=pool_df['config_type'],
+                y=pool_df[category],
+                name=category
+            ))
+
+        fig_breakdown.update_layout(
+            barmode='stack',
+            title=f'Cost Breakdown for Node Pool: {pool_name}',
+            yaxis_title='Estimated Monthly Cost (USD)',
+            xaxis_title='Configuration Type'
+        )
+        breakdown_figs[pool_name] = fig_breakdown
+
+
+    # Generate HTML
+    html_content = """
+    <html>
+    <head>
+        <title>GKE Node Pool Recommendation Report</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body { font-family: sans-serif; }
+            .container { margin: 20px; }
+            .chart { margin-bottom: 50px; }
+            table { border-collapse: collapse; margin-bottom: 30px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>GKE Node Pool Recommendation Report</h1>
+    """
+
+    # Add Summary Table
+    html_content += "<h2>Summary Table</h2>"
+    summary_table_data = []
+    for pool_name, data in recommendations.items():
+         current = data.get('current')
+         recommended = data.get('recommended')
+
+         if current and recommended:
+             summary_table_data.append({
+                 'Node Pool': pool_name,
+                 'Current Config': f"{current['machine_type']}, {current['node_count']} nodes, {current['max_pods_per_node']} max pods",
+                 'Recommended Config': f"{recommended['machine_type']}, {recommended['node_count']} nodes, {recommended['max_pods_per_node']} max pods",
+                 'Current Cost (USD/month)': f"${current['total_monthly_cost_usd']:.2f}",
+                 'Recommended Cost (USD/month)': f"${recommended['total_monthly_cost_usd']:.2f}",
+                 'Estimated Savings (USD/month)': f"${current['total_monthly_cost_usd'] - recommended['total_monthly_cost_usd']:.2f}",
+                 'Current CPU Util': f"{current['cpu_utilization']:.1%}",
+                 'Recommended CPU Util': f"{recommended['cpu_utilization']:.1%}",
+                 'Current Mem Util': f"{current['memory_utilization']:.1%}",
+                 'Recommended Mem Util': f"{recommended['memory_utilization']:.1%}",
+                 'Current IP Util': f"{current['ip_utilization']:.1%}",
+                 'Recommended IP Util': f"{recommended['ip_utilization']:.1%}",
+             })
+         elif current:
+              summary_table_data.append({
+                 'Node Pool': pool_name,
+                 'Current Config': f"{current['machine_type']}, {current['node_count']} nodes, {current['max_pods_per_node']} max pods",
+                 'Recommended Config': "N/A",
+                 'Current Cost (USD/month)': f"${current['total_monthly_cost_usd']:.2f}",
+                 'Recommended Cost (USD/month)': "N/A",
+                 'Estimated Savings (USD/month)': "N/A",
+                 'Current CPU Util': f"{current['cpu_utilization']:.1%}",
+                 'Recommended CPU Util': "N/A",
+                 'Current Mem Util': f"{current['memory_utilization']:.1%}",
+                 'Recommended Mem Util': "N/A",
+                 'Current IP Util': f"{current['ip_utilization']:.1%}",
+                 'Recommended IP Util': "N/A",
+             })
+         elif recommended:
+              summary_table_data.append({
+                 'Node Pool': pool_name,
+                 'Current Config': "N/A",
+                 'Recommended Config': f"{recommended['machine_type']}, {recommended['node_count']} nodes, {recommended['max_pods_per_node']} max pods",
+                 'Current Cost (USD/month)': "N/A",
+                 'Recommended Cost (USD/month)': f"${recommended['total_monthly_cost_usd']:.2f}",
+                 'Estimated Savings (USD/month)': "N/A",
+                 'Current CPU Util': "N/A",
+                 'Recommended CPU Util': f"{recommended['cpu_utilization']:.1%}",
+                 'Current Mem Util': "N/A",
+                 'Recommended Mem Util': f"{recommended['memory_utilization']:.1%}",
+                 'Current IP Util': "N/A",
+                 'Recommended IP Util': f"{recommended['ip_utilization']:.1%}",
+             })
+
+
+    if summary_table_data:
+        summary_df = pd.DataFrame(summary_table_data)
+        html_content += summary_df.to_html(index=False)
+    else:
+        html_content += "<p>No comparable data found for the summary table.</p>"
+
+    # Add Total Cost Comparison Chart
+    html_content += "<div class='chart'>"
+    html_content += pio.to_html(fig_cost_compare, full_html=False)
+    html_content += "</div>"
+
+    # Add Cost Breakdown Charts
+    html_content += "<h2>Cost Breakdown per Node Pool</h2>"
+    for pool_name, fig in breakdown_figs.items():
+         html_content += f"<h3>{pool_name}</h3>"
+         html_content += "<div class='chart'>"
+         html_content += pio.to_html(fig, full_html=False)
+         html_content += "</div>"
+
+
+    html_content += """
+        </div>
+    </body>
+    </html>
+    """
+
+    with open(output_path, "w") as f:
+        f.write(html_content)
+    print("HTML report generated successfully.")
+
+
+# --- Main Execution ---
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Recommend optimal node size, count, and max pods for GKE node pools.")
+    parser.add_argument("--project-id", required=True, help="Your Google Cloud project ID.")
+    parser.add_argument("--location", required=True, help="The GCP zone or region of the cluster (e.g., australia-southeast1-a or australia-southeast1).")
+    parser.add_argument("--cluster-name", required=True, help="The name of the GKE cluster.")
+    parser.add_argument("--sa-key-path", help="Path to a service account key file (optional). If not provided, uses Application Default Credentials.")
+    parser.add_argument("--candidate-machine-types",
+                        help=f"Comma-separated list of machine types to consider for recommendations (e.g., e2-standard-4,n2-standard-8). Defaults to: {','.join(DEFAULT_CANDIDATE_MACHINE_TYPES)}.",
+                        default=','.join(DEFAULT_CANDIDATE_MACHINE_TYPES))
+    parser.add_argument("--node-count-buffer", type=float,
+                        help=f"Buffer percentage for recommended node count (e.g., 15 for 15%%). Defaults to {DEFAULT_NODE_COUNT_BUFFER_PERCENT}.",
+                        default=DEFAULT_NODE_COUNT_BUFFER_PERCENT)
+    parser.add_argument("--system-overhead-cpu", type=float,
+                        help=f"Estimated system CPU overhead per node in cores (e.g., 0.1). Defaults to {DEFAULT_SYSTEM_OVERHEAD_CPU}.",
+                        default=DEFAULT_SYSTEM_OVERHEAD_CPU)
+    parser.add_argument("--system-overhead-mem", type=float,
+                        help=f"Estimated system memory overhead per node in GiB (e.g., 0.128). Defaults to {DEFAULT_SYSTEM_OVERHEAD_MEMORY_GB}.",
+                        default=DEFAULT_SYSTEM_OVERHEAD_MEMORY_GB)
+    parser.add_argument("--weights",
+                        help=f"Comma-separated key=value pairs for scoring weights (e.g., cost=0.4,utilization=0.3). Defaults to: {','.join([f'{k}={v}' for k,v in DEFAULT_SCORE_WEIGHTS.items()])}.",
+                        default=','.join([f'{k}={v}' for k,v in DEFAULT_SCORE_WEIGHTS.items()]))
+    parser.add_argument("--output-html", help="Output path for the HTML report (optional). If not provided, only prints to console.")
+
+
+    args = parser.parse_args()
+
+    # Parse weights from command line
+    try:
+        user_weights = {}
+        for item in args.weights.split(','):
+            key, value = item.split('=')
+            user_weights[key.strip()] = float(value.strip())
+        # Validate weights against known keys
+        for key in user_weights.keys():
+             if key not in DEFAULT_SCORE_WEIGHTS:
+                  print(f"Warning: Unknown weight key '{key}'. Ignoring.", file=sys.stderr)
+        # Use user weights, falling back to default if a key is missing
+        actual_weights = DEFAULT_SCORE_WEIGHTS.copy()
+        for key in actual_weights.keys():
+             if key in user_weights:
+                  actual_weights[key] = user_weights[key]
+        print(f"Using scoring weights: {actual_weights}")
+
+    except:
+        print(f"Error parsing weights argument. Using default weights: {DEFAULT_SCORE_WEIGHTS}", file=sys.stderr)
+        actual_weights = DEFAULT_SCORE_WEIGHTS
+
+    # Parse candidate machine types
+    candidate_mts = [mt.strip() for mt in args.candidate_machine_types.split(',') if mt.strip()]
+    # Validate candidate machine types against hard-coded pricing
+    valid_candidate_mts = [mt for mt in candidate_mts if mt in MACHINE_TYPE_PRICING_SYDNEY]
+    if not valid_candidate_mts:
+         print("Error: No valid candidate machine types provided or found in hard-coded pricing.", file=sys.stderr)
+         print(f"Available hard-coded machine types: {list(MACHINE_TYPE_PRICING_SYDNEY.keys())}", file=sys.stderr)
+         sys.exit(1)
+    print(f"Considering candidate machine types: {valid_candidate_mts}")
+
+
+    recommendations = analyze_gke_cluster(
+        project_id=args.project_id,
+        zone_or_region=args.location,
+        cluster_name=args.cluster_name,
+        sa_key_path=args.sa_key_path,
+        candidate_machine_types=valid_candidate_mts,
+        node_count_buffer_percent=args.node_count_buffer,
+        system_overhead_cpu=args.system_overhead_cpu,
+        system_overhead_memory_gb=args.system_overhead_mem,
+        score_weights=actual_weights
+    )
+
+    if recommendations:
+        print_recommendations_to_console(recommendations)
+        if args.output_html:
+            generate_html_report(recommendations, args.output_html)
+    else:
+        print("\nNo recommendations could be generated.", file=sys.stderr)
+
